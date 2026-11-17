@@ -88,6 +88,9 @@ class BatchOperationsImpl:
         self.naming_convention = naming_convention
         self.partial_reordering = partial_reordering
         self.batch = []
+        # FTS specs whose triggers were detached for an in-progress
+        # rebuild; populated by _handle_managed_fts().
+        self._pending_fts_specs: List[Any] = []
 
     @property
     def dialect(self) -> Dialect:
@@ -160,7 +163,18 @@ class BatchOperationsImpl:
                     fn = getattr(batch_impl, opname)
                     fn(*arg, **kw)
 
-                batch_impl._create(self.impl)
+                self._handle_managed_fts(batch_impl)
+                try:
+                    batch_impl._create(self.impl)
+                except BaseException:
+                    # the copy-and-rename failed before completion (or
+                    # while renaming); re-arm the FTS synchronization
+                    # triggers of the still-existing content table so the
+                    # index keeps accepting ordinary SQL writes.  The
+                    # enclosing transaction rolls every data change back.
+                    self._rearm_managed_fts_after_failure()
+                    raise
+                self._reindex_managed_fts_after_rebuild()
 
     def alter_column(self, *arg, **kw) -> None:
         self.batch.append(("alter_column", arg, kw))
@@ -207,6 +221,111 @@ class BatchOperationsImpl:
 
     def create_column_comment(self, column):
         self.batch.append(("create_column_comment", (column,), {}))
+
+    # ------------------------------------------------------------------
+    # managed FTS5 index hand-off during a content-table rebuild
+    # ------------------------------------------------------------------
+    def _managed_fts_specs(self):
+        """Return the validated managed FTS specs on this content table.
+
+        Returns an empty list on non-SQLite dialects, in offline mode or
+        when no registry exists, so ordinary batch behavior is unchanged.
+        """
+
+        from . import fts
+
+        context = self.operations.migration_context
+        if context.as_sql or context.dialect.name != "sqlite":
+            return []
+        if self.schema is not None:
+            return []
+        connection = context.bind
+        if connection is None:
+            return []
+        manager = fts.FTSIndexManager(connection)
+        if not manager.registry_exists():
+            return []
+        specs = manager.verify_all()
+        return [
+            spec
+            for spec in specs.values()
+            if spec.table_name == self.table_name
+        ]
+
+    def _handle_managed_fts(self, batch_apply: ApplyBatchImpl) -> None:
+        """Detach sync triggers before the copy-and-rename rebuild."""
+
+        from . import fts
+
+        specs = self._managed_fts_specs()
+        if not specs:
+            self._pending_fts_specs = []
+            return
+        context = self.operations.migration_context
+        manager = fts.FTSIndexManager(context.bind)
+        for spec in specs:
+            manager.detach_triggers(spec)
+        self._pending_fts_specs = specs
+
+    def _reindex_managed_fts_after_rebuild(self) -> None:
+        """Rebuild managed indexes from the new content table and
+        re-create their synchronization triggers."""
+
+        from . import fts
+
+        specs = getattr(self, "_pending_fts_specs", [])
+        if not specs:
+            return
+        context = self.operations.migration_context
+        manager = fts.FTSIndexManager(context.bind)
+        for spec in specs:
+            manager.reindex_index(spec)
+        self._pending_fts_specs = []
+
+    def _rearm_managed_fts_after_failure(self) -> None:
+        """Best-effort re-creation of the sync triggers after a failed
+        rebuild.
+
+        When the surrounding statements run inside a transaction that
+        will be rolled back, the original triggers come back with the
+        rollback and this is a harmless no-op.  Under pysqlite's default
+        (DDL autocommits outside an explicit transaction), however, the
+        trigger drops may already have persisted; recreating them here
+        keeps the surviving content table/index synchronized without
+        touching any rows.
+        """
+
+        from . import fts
+
+        specs = getattr(self, "_pending_fts_specs", [])
+        if not specs:
+            return
+        context = self.operations.migration_context
+        if context.bind is None:
+            return
+        manager = fts.FTSIndexManager(context.bind)
+        master = manager.master_rows()
+        for spec in specs:
+            # only re-arm when the content table still exists under its
+            # public name and the FTS table survived; otherwise the outer
+            # rollback owns recovery.
+            if spec.table_name not in master or spec.name not in master:
+                continue
+            for trigger_name, trigger_sql in zip(
+                spec.trigger_names, spec.create_triggers_sql()
+            ):
+                if trigger_name in master:
+                    # already present (e.g. the outer transaction rolled
+                    # the DROP back); nothing to do.
+                    continue
+                try:
+                    from sqlalchemy import text as _text
+
+                    context.bind.execute(_text(trigger_sql))
+                except Exception:
+                    # never mask the original rebuild failure
+                    break
+        self._pending_fts_specs = []
 
 
 class ApplyBatchImpl:

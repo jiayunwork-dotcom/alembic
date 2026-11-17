@@ -24,6 +24,7 @@ from sqlalchemy.sql.elements import Label
 from sqlalchemy.sql.elements import quoted_name
 
 from .. import util
+from ..operations import fts_ops as fts_ops_mod
 from ..operations import ops
 from ..util import sqla_compat
 
@@ -109,7 +110,9 @@ def _render_cmd_body(
     has_lines = False
 
     if render_mode == "grouped":
-        has_lines = _render_grouped_body(op_container, autogen_context, printer)
+        has_lines = _render_grouped_body(
+            op_container, autogen_context, printer
+        )
     else:
         for op in op_container.ops:
             lines = render_op(autogen_context, op)
@@ -139,10 +142,15 @@ def _render_grouped_body(
     front because the grouped context can only emit the supported batch
     directives atomically.
     """
+    from ..operations.fts_ops import CreateFTSIndexOp
+    from ..operations.fts_ops import DropFTSIndexOp
+
+    fts_op_types = (CreateFTSIndexOp, DropFTSIndexOp)
     unsupported = [
         op
         for op in op_container.ops
         if not isinstance(op, ops.ModifyTableOps)
+        and not isinstance(op, fts_op_types)
     ]
     if unsupported:
         names = ", ".join(op.__class__.__name__ for op in unsupported)
@@ -157,7 +165,10 @@ def _render_grouped_body(
     table_blocks = [
         op for op in op_container.ops if isinstance(op, ops.ModifyTableOps)
     ]
-    if not table_blocks:
+    fts_blocks = [
+        op for op in op_container.ops if isinstance(op, fts_op_types)
+    ]
+    if not table_blocks and not fts_blocks:
         return False
 
     printer.writeline("with op.sqlite_batch_group():")
@@ -169,12 +180,22 @@ def _render_grouped_body(
                 any_lines = True
                 for line in lines:
                     printer.writeline(line)
+    # FTS lifecycle operations join the same atomic group transaction
+    # but are top-level Operations directives, not batch directives;
+    # render them after the batch blocks at group indentation, with the
+    # batch flag cleared so they use the op. (not batch_op.) prefix.
+    for fts_op in fts_blocks:
+        for line in render_op(autogen_context, fts_op):
+            any_lines = True
+            for sub in line.split("\n"):
+                printer.writeline("    " + sub)
     if not any_lines:
         printer.writeline("    pass")
     # close the group block so that the trailing comment is rendered at
     # the function body indent level rather than inside the group.
     printer.writeline("")
     return True
+
 
 def render_op(
     autogen_context: AutogenContext, op: ops.MigrateOperation
@@ -356,6 +377,31 @@ def _drop_table(autogen_context: AutogenContext, op: ops.DropTableOp) -> str:
 
     text += ")"
     return text
+
+
+@renderers.dispatch_for(fts_ops_mod.CreateFTSIndexOp)
+def _render_create_fts_index(
+    autogen_context: AutogenContext, op: fts_ops_mod.CreateFTSIndexOp
+) -> str:
+    prefix = _alembic_autogenerate_prefix(autogen_context)
+    lines = [
+        f"{prefix}create_fts_index(",
+        f"    {_ident(op.name)!r},",
+        f"    {_ident(op.table_name)!r},",
+        f"    {[str(c) for c in op.columns]!r},",
+    ]
+    if op.tokenize != "unicode61":
+        lines.append(f"    tokenize={op.tokenize!r},")
+    lines.append(")")
+    return "\n".join(lines)
+
+
+@renderers.dispatch_for(fts_ops_mod.DropFTSIndexOp)
+def _render_drop_fts_index(
+    autogen_context: AutogenContext, op: fts_ops_mod.DropFTSIndexOp
+) -> str:
+    prefix = _alembic_autogenerate_prefix(autogen_context)
+    return f"{prefix}drop_fts_index({_ident(op.name)!r})"
 
 
 def _render_dialect_kwargs_items(

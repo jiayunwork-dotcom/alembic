@@ -78,6 +78,20 @@ class _ProxyTransaction:
         return self
 
     def __exit__(self, type_: Any, value: Any, traceback: Any) -> None:
+        # an op.create_fts_index()/drop_fts_index() that ran in this
+        # revision opened an explicit SQLite transaction (pysqlite
+        # autocommits DDL otherwise).  Its commit/rollback hooks drive
+        # the raw BEGIN/COMMIT boundary and restore the connection.
+        fts_hooks = self.migration_context._sqlite_fts_tx_hooks
+        if (
+            fts_hooks is not None
+            and not self.migration_context._sqlite_fts_finalized
+        ):
+            if type_ is None:
+                fts_hooks["commit"]()
+            else:
+                fts_hooks["rollback"]()
+            self.migration_context._sqlite_fts_finalized = True
         # an op.sqlite_batch_group() that ran in this revision owns the
         # actual SQLite transaction (with transactional DDL); commit or
         # roll it back here, after the alembic_version stamp has run.
@@ -168,6 +182,12 @@ class MigrationContext:
         self._sqlite_restoring: bool = False
         self._sqlite_version_write_allowed: bool = False
         self._sqlite_write_listener: Optional[Any] = None
+
+        # state used by Operations.create_fts_index()/drop_fts_index():
+        # hooks for the explicit SQLite transaction that makes FTS DDL
+        # transactional under pysqlite.
+        self._sqlite_fts_tx_hooks: Optional[Any] = None
+        self._sqlite_fts_finalized: bool = False
 
         if as_sql:
             self.connection = cast(

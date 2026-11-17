@@ -35,6 +35,7 @@ from typing import Dict
 from typing import Iterator
 from typing import List
 from typing import Optional
+from typing import Set
 from typing import TYPE_CHECKING
 
 from sqlalchemy import event
@@ -105,6 +106,8 @@ class SQLiteBatchGroup:
         self.connection: "Connection" = self.context.bind  # type: ignore
         self._plans: Dict[str, BatchOperationsImpl] = OrderedTablePlans()
         self._temp_prefix = temp_prefix or _TMP_PREFIX
+        # populated by _preflight(): FTS specs keyed by content table
+        self._fts_specs_by_table: Dict[str, List[Any]] = {}
 
         # the autocommit wrapper connection while the group is active;
         # ``None`` means the group has not started yet.
@@ -202,6 +205,24 @@ class SQLiteBatchGroup:
             elif type_ == "view":
                 view_sql[name] = sql_text or ""
 
+        # FTS synchronization triggers owned by this Alembic feature are
+        # part of the managed lifecycle of a rebuilt content table and
+        # must not trip the generic "table has triggers" rejection.
+        from . import fts
+
+        fts_manager = fts.FTSIndexManager(self.connection)
+        managed_fts_specs = (
+            fts_manager.verify_all() if fts_manager.registry_exists() else {}
+        )
+        managed_trigger_names: Set[str] = set()
+        self._fts_specs_by_table.clear()
+        for spec in managed_fts_specs.values():
+            for trigger_name in spec.trigger_names:
+                managed_trigger_names.add(trigger_name)
+            self._fts_specs_by_table.setdefault(spec.table_name, []).append(
+                spec
+            )
+
         existing_table_names = {
             row[1] for row in master_rows if row[0] == "table"
         }
@@ -224,24 +245,31 @@ class SQLiteBatchGroup:
                     f"Table '{table_name}' is a virtual table; virtual "
                     "tables cannot be rebuilt inside sqlite_batch_group()."
                 )
-            if table_name in triggers_by_table:
+            unmanaged_triggers = [
+                trigger_name
+                for trigger_name in triggers_by_table.get(table_name, [])
+                if trigger_name not in managed_trigger_names
+            ]
+            if unmanaged_triggers:
                 raise util.CommandError(
                     f"Table '{table_name}' has SQLite trigger(s) "
-                    f"{triggers_by_table[table_name]}; tables with "
+                    f"{unmanaged_triggers}; tables with "
                     "triggers cannot be rebuilt inside "
                     "sqlite_batch_group(). Drop and recreate the trigger "
-                    "outside of the group instead."
+                    "outside of the group instead. (Alembic-managed FTS "
+                    "synchronization triggers are handled automatically.)"
                 )
-            self._check_view_dependencies(
-                table_name, view_names, view_sql
-            )
+            self._check_view_dependencies(table_name, view_names, view_sql)
 
         # make sure every temporary name we are going to use is free and
         # unique across the group.
         used_temp_names = set()
         for table_name in self._plans:
             temp_name = self._temp_name(table_name)
-            if temp_name in existing_table_names or temp_name in used_temp_names:
+            if (
+                temp_name in existing_table_names
+                or temp_name in used_temp_names
+            ):
                 raise util.CommandError(
                     f"Temporary table name '{temp_name}' required for the "
                     "grouped migration already exists; cannot proceed "
@@ -261,8 +289,7 @@ class SQLiteBatchGroup:
         pattern = re.compile(
             r"(?<![A-Za-z0-9_\"`\[])(?:"
             r"%s|\"%s\"|`%s`|\[%s\])"
-            r"(?![A-Za-z0-9_\"`\]])"
-            % (escaped, escaped, escaped, escaped),
+            r"(?![A-Za-z0-9_\"`\]])" % (escaped, escaped, escaped, escaped),
             re.IGNORECASE,
         )
         for view_name in view_names:
@@ -351,9 +378,7 @@ class SQLiteBatchGroup:
         self._commit_any_open_transaction()
 
         self._saved_foreign_keys = int(
-            self.connection.exec_driver_sql(
-                "PRAGMA foreign_keys"
-            ).scalar()
+            self.connection.exec_driver_sql("PRAGMA foreign_keys").scalar()
         )
         # the pragma select itself autobegot a transaction; close it as
         # well.
@@ -482,6 +507,16 @@ class SQLiteBatchGroup:
                 fn(*arg, **kw)
             return
 
+        from . import fts
+
+        fts_specs = self._fts_specs_by_table.get(table_name, [])
+        assert self._autocommit_connection is not None
+        fts_manager = fts.FTSIndexManager(self._autocommit_connection)
+        # detach FTS synchronization triggers before the copy so that
+        # populating the replacement table does not double-index rows.
+        for spec in fts_specs:
+            fts_manager.detach_triggers(spec)
+
         if batch_impl.copy_from is not None:  # pragma: no cover - guarded
             existing_table = batch_impl.copy_from
             reflected = False
@@ -523,6 +558,12 @@ class SQLiteBatchGroup:
             fn(*arg, **kw)
 
         batch_apply._create(self.impl)
+
+        # the rebuilt table now holds every surviving row under the same
+        # rowid values; rebuild each managed FTS index from it and re-arm
+        # the synchronization triggers, all inside the group transaction.
+        for spec in fts_specs:
+            fts_manager.reindex_index(spec)
 
     def _run_foreign_key_check(self) -> None:
         assert self._autocommit_connection is not None
@@ -668,9 +709,7 @@ def install_group_guards(context: "MigrationContext") -> None:
         ctx._sqlite_user_writes += 1
 
     try:
-        event.listen(
-            connection, "before_cursor_execute", _track_write
-        )
+        event.listen(connection, "before_cursor_execute", _track_write)
     except Exception:
         # mock / offline connections do not provide cursor events; the
         # write guard only applies to live connections.

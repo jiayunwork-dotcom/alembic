@@ -64,6 +64,13 @@ def _populate_migration_script(
     downgrade_ops = migration_script.downgrade_ops_list[-1]
 
     _produce_net_changes(autogen_context, upgrade_ops)
+    from . import fts_compare
+
+    fts_compare.compare_fts_indexes(
+        autogen_context,
+        upgrade_ops,
+        fts_compare.metadata_for_fts(autogen_context.metadata),
+    )
     upgrade_ops.reverse_into(downgrade_ops)
 
 
@@ -109,6 +116,14 @@ def _autogen_for_tables(
 ) -> None:
     inspector = autogen_context.inspector
 
+    # Names of SQLite FTS5 objects (registry table, virtual tables,
+    # shadow tables, sync triggers) owned by this Alembic feature. They
+    # must never be treated as ordinary business tables. User-created
+    # FTS tables have no registry entry and are therefore not filtered.
+    from . import fts_compare
+
+    managed_fts_names = fts_compare.get_managed_object_names(autogen_context)
+
     conn_table_names: Set[Tuple[Optional[str], str]] = set()
 
     version_table_schema = (
@@ -122,6 +137,10 @@ def _autogen_for_tables(
             tables = tables.difference(
                 [autogen_context.migration_context.version_table]
             )
+        if schema_name is None:
+            tables = {
+                tname for tname in tables if tname not in managed_fts_names
+            }
 
         conn_table_names.update(
             (schema_name, tname)

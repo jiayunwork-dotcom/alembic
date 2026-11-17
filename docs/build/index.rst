@@ -14,6 +14,7 @@ with the `SQLAlchemy <https://www.sqlalchemy.org>`_ Database Toolkit for Python.
    offline
    naming
    batch
+   sqlite_fts5
    branches
    ops
    cookbook
