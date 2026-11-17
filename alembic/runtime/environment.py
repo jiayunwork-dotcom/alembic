@@ -423,7 +423,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         starting_rev: Optional[str] = None,
         tag: Optional[str] = None,
         template_args: Optional[Dict[str, Any]] = None,
-        render_as_batch: bool = False,
+        render_as_batch: Union[bool, str] = False,
         target_metadata: Union[MetaData, Sequence[MetaData], None] = None,
         include_name: Optional[IncludeNameFn] = None,
         include_object: Optional[IncludeObjectFn] = None,
@@ -727,13 +727,20 @@ class EnvironmentContext(util.ModuleClsProxy):
 
             :paramref:`.EnvironmentContext.configure.include_schemas`
 
-        :param render_as_batch: if True, commands which alter elements
-         within a table will be placed under a ``with batch_alter_table():``
-         directive, so that batch migrations will take place.
+        :param render_as_batch: controls how commands which alter elements
+         within a table are rendered.  When ``False`` (the default), plain
+         ``alter_*`` directives are emitted.  When ``True``, the changes of
+         each table are placed under a ``with batch_alter_table():``
+         directive.  When set to the string ``"grouped"``, all
+         per-table batch blocks of one revision are additionally wrapped
+         together in a ``with op.sqlite_batch_group():`` block so that
+         related tables can be rebuilt atomically on SQLite.
 
          .. seealso::
 
             :ref:`batch_migrations`
+
+            :ref:`sqlite_grouped_batch`
 
         :param include_schemas: If True, autogenerate will scan across
          all schemas located by the SQLAlchemy
@@ -893,7 +900,9 @@ class EnvironmentContext(util.ModuleClsProxy):
         opts["include_name"] = include_name
         opts["include_object"] = include_object
         opts["include_schemas"] = include_schemas
-        opts["render_as_batch"] = render_as_batch
+        opts["render_as_batch"] = self._validate_render_as_batch(
+            render_as_batch
+        )
         opts["upgrade_token"] = upgrade_token
         opts["downgrade_token"] = downgrade_token
         opts["sqlalchemy_module_prefix"] = sqlalchemy_module_prefix
@@ -919,6 +928,15 @@ class EnvironmentContext(util.ModuleClsProxy):
             environment_context=self,
             dialect_opts=dialect_opts,
             opts=opts,
+        )
+
+    @staticmethod
+    def _validate_render_as_batch(render_as_batch: Any) -> Any:
+        if render_as_batch in (False, True, "grouped"):
+            return render_as_batch
+        raise ValueError(
+            "render_as_batch must be False, True or the string "
+            f"'grouped'; got {render_as_batch!r}"
         )
 
     def run_migrations(self, **kw: Any) -> None:

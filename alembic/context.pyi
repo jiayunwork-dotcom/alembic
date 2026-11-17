@@ -100,7 +100,7 @@ def configure(
     starting_rev: Optional[str] = None,
     tag: Optional[str] = None,
     template_args: Optional[Dict[str, Any]] = None,
-    render_as_batch: bool = False,
+    render_as_batch: Union[bool, Literal["grouped"]] = False,
     target_metadata: Union[MetaData, Sequence[MetaData], None] = None,
     include_name: Optional[
         Callable[
@@ -489,9 +489,12 @@ def configure(
 
         :paramref:`.EnvironmentContext.configure.include_schemas`
 
-    :param render_as_batch: if True, commands which alter elements
-     within a table will be placed under a ``with batch_alter_table():``
-     directive, so that batch migrations will take place.
+    :param render_as_batch: ``False`` for plain directives, ``True`` to
+     place commands which alter elements within a table under a
+     ``with batch_alter_table():`` directive, or the string ``"grouped"``
+     to additionally wrap the batch blocks of a revision in a single
+     ``with op.sqlite_batch_group():`` block for atomic SQLite
+     multi-table migrations.
 
      .. seealso::
 

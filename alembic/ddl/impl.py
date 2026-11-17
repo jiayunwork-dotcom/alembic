@@ -230,6 +230,7 @@ class DefaultImpl(metaclass=ImplMeta):
             )
             return None
         else:
+            self._check_sqlite_grouped_write_allowed(construct)
             conn = self.connection
             assert conn is not None
             if execution_options:
@@ -244,6 +245,52 @@ class DefaultImpl(metaclass=ImplMeta):
                 return conn.execute(construct, multiparams)
             else:
                 return conn.execute(construct, params)
+
+    def _check_sqlite_grouped_write_allowed(
+        self, construct: Executable
+    ) -> None:
+        """Reject user writes that cannot be part of a SQLite batch group
+        transaction.
+
+        Once an ``sqlite_batch_group()`` has run in a revision, the group
+        transaction remains open until the revision owner commits it.
+        Statements routed through the migration implementation after the
+        group has finalized are therefore rejected, except for the
+        ``alembic_version`` update which must run inside that same
+        transaction.
+        """
+        ctx = getattr(self, "migration_context", None)
+        if ctx is None:
+            return
+        if not getattr(ctx, "_sqlite_guard_installed", False):
+            return
+
+        # statements routed while the group is open run inside the group
+        # transaction and are fine.
+        if ctx.sqlite_batch_group is not None:
+            return
+
+        # the alembic_version update is explicitly whitelisted.
+        if ctx._sqlite_version_write_allowed:
+            return
+
+        # a group already ran in this revision: any further write through
+        # the migration implementation would escape the all-or-nothing
+        # contract (e.g. an implicit autocommit).
+        if ctx._sqlite_group_finalized:
+            statement = str(
+                construct.compile(
+                    dialect=self.dialect,
+                    compile_kwargs={"literal_binds": True},
+                )
+            )
+            raise util.CommandError(
+                "Statements cannot be executed after "
+                "sqlite_batch_group() within the same migration revision; "
+                "the group transaction is still open and is committed "
+                "together with the alembic_version update. Offending "
+                f"statement: {statement}"
+            )
 
     def execute(
         self,

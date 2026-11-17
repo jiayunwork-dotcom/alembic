@@ -378,3 +378,116 @@ transactional DDL.
 Note that also as is the case with SQLite, CHECK constraints need to be
 moved over between old and new table manually using the
 :paramref:`.Operations.batch_alter_table.table_args` parameter.
+
+
+.. _sqlite_grouped_batch:
+
+SQLite grouped batch migrations (multi-table)
+---------------------------------------------
+
+Ordinary :meth:`.Operations.batch_alter_table` blocks rebuild **one table at
+a time**.  On SQLite this means the application has to switch
+``PRAGMA foreign_keys`` off in ``env.py`` while the migration runs, because
+the intermediate, partially-migrated schema would otherwise violate foreign
+keys.  This manual switch is awkward for tables that reference each other,
+including self-referential foreign keys and multi-table foreign key cycles,
+and a per-table rebuild offers no single transaction across the whole
+migration.
+
+The :meth:`.Operations.sqlite_batch_group` context manager collects several
+``batch_alter_table()`` blocks and applies them as **one atomic grouped
+migration**, taking ownership of the ``foreign_keys`` pragma and the
+transaction so that ``env.py`` no longer has to::
+
+    def upgrade() -> None:
+        with op.sqlite_batch_group():
+            with op.batch_alter_table("orders") as batch_op:
+                batch_op.alter_column(
+                    "note", existing_type=sa.String(20), nullable=False
+                )
+            with op.batch_alter_table("order_items") as batch_op:
+                batch_op.alter_column(
+                    "label", existing_type=sa.String(20), nullable=False
+                )
+
+Inside the group the following batch directives are supported:
+``alter_column``, ``add_column``, ``drop_column``, ``create_foreign_key``,
+``drop_constraint``, ``create_index`` and ``drop_index``.  Tables whose
+changes can be applied with a native ``ALTER TABLE`` (for example a plain
+``add_column``) are altered directly and never use a copy table, while the
+others use the same copy-and-rename machinery as regular batch mode.
+
+Configuration
+~~~~~~~~~~~~~
+
+Grouped migrations are online, SQLite-only, and require
+:paramref:`.EnvironmentContext.configure.transaction_per_migration` to be
+enabled, because the group transaction must also cover the
+``alembic_version`` update::
+
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        transaction_per_migration=True,
+    )
+
+How it works, and the trade-offs
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When the group starts, Alembic:
+
+1. validates every collected plan against the live database **before any
+   change is made**;
+2. records the current value of ``PRAGMA foreign_keys`` and disables foreign
+   key enforcement for the duration of the rebuild;
+3. opens a single explicit SQLite transaction (``BEGIN``) so that DDL is
+   transactional - pysqlite would otherwise auto-commit DDL statements;
+4. rebuilds the tables that need it, using group-unique temporary table
+   names, and applies native ``ALTER TABLE`` to the others;
+5. runs ``PRAGMA foreign_key_check`` and only then commits, restoring the
+   previous ``foreign_keys`` value.
+
+Because every table of the group is rebuilt inside the same transaction
+while foreign keys are temporarily disabled, foreign key cycles and
+self-references need no special ordering, and tables *outside* the group
+(including tables that reference group tables with ``ON DELETE CASCADE``)
+are never touched.
+
+* **Rollback reliability.** If any step fails - copying data, creating an
+  index, or writing the version row - the whole transaction is rolled back
+  and the database is left exactly as it was before the revision; the
+  original error is re-raised unchanged, and no data is modified or deleted
+  to make constraints pass.
+* **Temporary disk usage.** Each rebuilt table briefly occupies a second
+  copy of its data, so peak extra disk space is roughly the sum of the
+  rebuilt tables' sizes.  Temporary tables, indexes and references are
+  always removed (or rolled back) and never remain in ``sqlite_master``.
+* **Lock hold time.** The write lock is held for the whole rebuild, which
+  is longer than an independent per-table migration.  This is the cost of
+  making the change atomic; other connections cannot observe a partially
+  migrated schema and simply block until commit or rollback.
+* **Scope.** Only ordinary tables in the main database may be rebuilt.
+  Virtual tables, tables with triggers, and views (or other schema objects)
+  that depend on a rebuilt table are rejected up front; drop and recreate
+  such objects around the group yourself.  Offline ``--sql`` mode,
+  pre-existing caller transactions, nested groups and more than one group
+  per revision are likewise rejected before anything changes.
+
+Autogenerate
+~~~~~~~~~~~~
+
+Set :paramref:`.EnvironmentContext.configure.render_as_batch` to the string
+``"grouped"`` to have autogenerate wrap the per-table batch blocks of a
+revision in a single ``op.sqlite_batch_group()`` block::
+
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        render_as_batch="grouped",
+    )
+
+The existing ``False`` (plain directives) and ``True`` (per-table batch
+blocks, no group) behaviors are unchanged.  Because a group can only alter
+existing tables, a revision that also creates or drops whole tables cannot
+be rendered as one group and autogenerate reports the unsupported
+differences instead of emitting a script that would fail at runtime.

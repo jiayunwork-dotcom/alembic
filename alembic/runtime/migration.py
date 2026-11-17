@@ -31,6 +31,7 @@ from typing_extensions import ContextManager
 
 from .. import ddl
 from .. import util
+from ..operations import grouped
 from ..util import sqla_compat
 from ..util.compat import EncodedIO
 
@@ -77,6 +78,15 @@ class _ProxyTransaction:
         return self
 
     def __exit__(self, type_: Any, value: Any, traceback: Any) -> None:
+        # an op.sqlite_batch_group() that ran in this revision owns the
+        # actual SQLite transaction (with transactional DDL); commit or
+        # roll it back here, after the alembic_version stamp has run.
+        group = self.migration_context.sqlite_batch_group
+        if group is not None and not group._restored:
+            if type_ is None:
+                group.commit_group()
+            else:
+                group.rollback()
         if self._proxied_transaction is not None:
             self._proxied_transaction.__exit__(type_, value, traceback)
             self.migration_context._transaction = None
@@ -149,6 +159,16 @@ class MigrationContext:
         self.on_version_apply_callbacks = opts.get("on_version_apply", ())
         self._transaction: Optional[Transaction] = None
 
+        # state used by Operations.sqlite_batch_group() on SQLite; None for
+        # every other backend / configuration path.
+        self.sqlite_batch_group: Optional[Any] = None
+        self._sqlite_guard_installed: bool = False
+        self._sqlite_user_writes: int = 0
+        self._sqlite_group_finalized: bool = False
+        self._sqlite_restoring: bool = False
+        self._sqlite_version_write_allowed: bool = False
+        self._sqlite_write_listener: Optional[Any] = None
+
         if as_sql:
             self.connection = cast(
                 Optional["Connection"], self._stdout_connection(connection)
@@ -201,6 +221,7 @@ class MigrationContext:
             self.output_buffer,
             opts,
         )
+        self.impl.migration_context = self
 
         self._version = self.impl.version_table_impl(
             version_table=version_table,
@@ -613,6 +634,18 @@ class MigrationContext:
 
         assert self._migrations_fn is not None
         for step in self._migrations_fn(heads, self):
+            # SQLite grouped batch migrations need a per-revision view of
+            # user writes so that statements which cannot be made atomic
+            # with the group can be rejected before anything changes.
+            sqlite_grouped_mode = (
+                not self.as_sql
+                and self.dialect.name == "sqlite"
+                and self._transaction_per_migration
+                and not self._in_external_transaction
+            )
+            if sqlite_grouped_mode:
+                grouped.install_group_guards(self)
+
             with self.begin_transaction(_per_migration=True):
                 if self.as_sql and not head_maintainer.heads:
                     # for offline mode, include a CREATE TABLE from
@@ -624,14 +657,33 @@ class MigrationContext:
                     self.impl.static_output(
                         "-- Running %s" % (step.short_log,)
                     )
-                step.migration_fn(**kw)
+                try:
+                    step.migration_fn(**kw)
+                except BaseException:
+                    if sqlite_grouped_mode:
+                        # a failed group rolls its own transaction back;
+                        # ensure the MigrationContext connection state is
+                        # cleaned up regardless of where the failure
+                        # originated. The proxy __exit__ is a no-op once
+                        # the group is already restored.
+                        active = self.sqlite_batch_group
+                        if active is not None:
+                            active.rollback()
+                    raise
 
                 # previously, we wouldn't stamp per migration
                 # if we were in a transaction, however given the more
                 # complex model that involves any number of inserts
                 # and row-targeted updates and deletes, it's simpler for now
                 # just to run the operations on every version
-                head_maintainer.update_to_step(step)
+                if sqlite_grouped_mode:
+                    # whitelist the version stamp; it must run inside the
+                    # (still open) group transaction when a group was used
+                    self._sqlite_version_write_allowed = True
+                try:
+                    head_maintainer.update_to_step(step)
+                finally:
+                    self._sqlite_version_write_allowed = False
                 for callback in self.on_version_apply_callbacks:
                     callback(
                         ctx=self,
@@ -639,6 +691,9 @@ class MigrationContext:
                         heads=set(head_maintainer.heads),
                         run_args=kw,
                     )
+
+            if sqlite_grouped_mode:
+                grouped.remove_group_guards(self)
 
         if self.as_sql and not head_maintainer.heads:
             assert self.connection is not None

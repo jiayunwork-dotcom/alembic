@@ -4,6 +4,36 @@ Changelog
 ==========
 
 .. changelog::
+    :version: 1.18.0
+    :released: not released
+
+    .. change::
+        :tags: feature, sqlite, operations, autogenerate
+
+        Added the :meth:`.Operations.sqlite_batch_group` context manager,
+        which runs several :meth:`.Operations.batch_alter_table` blocks as a
+        single atomic SQLite migration for related tables.  Unlike the
+        per-table rebuild, the group temporarily disables
+        ``PRAGMA foreign_keys`` itself, rebuilds every table of the group in
+        one transaction (including tables linked by foreign key cycles or
+        self-references), runs ``PRAGMA foreign_key_check`` and commits the
+        schema changes together with the ``alembic_version`` update,
+        restoring the previous ``foreign_keys`` setting on both success and
+        failure.  Tables outside the group, including those referencing
+        group tables with ``ON DELETE CASCADE``, are left untouched.
+
+        :paramref:`.EnvironmentContext.configure.render_as_batch` now also
+        accepts the string ``"grouped"`` so that autogenerate emits the
+        per-table batch blocks of a revision inside one
+        ``op.sqlite_batch_group()`` block; revisions that also create or
+        drop whole tables are rejected instead of producing a script that
+        cannot run atomically.
+
+        .. seealso::
+
+            :ref:`sqlite_grouped_batch`
+
+.. changelog::
     :version: 1.17.2
     :released: November 14, 2025
 

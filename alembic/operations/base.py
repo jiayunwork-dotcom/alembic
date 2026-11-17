@@ -25,6 +25,7 @@ from typing import Union
 from sqlalchemy.sql.elements import conv
 
 from . import batch
+from . import grouped
 from . import schemaobj
 from .. import util
 from ..util import sqla_compat
@@ -406,8 +407,82 @@ class AbstractOperations(util.ModuleClsProxy):
             partial_reordering,
         )
         batch_op = BatchOperations(self.migration_context, impl=impl)
+
+        active_group = getattr(
+            self.migration_context, "sqlite_batch_group", None
+        )
+        if active_group is not None:
+            # collect the plan; it is flushed together with the rest of
+            # the group when the outer sqlite_batch_group() context ends.
+            active_group.register(impl)
+            yield batch_op
+            return
+
         yield batch_op
         impl.flush()
+
+    @contextmanager
+    def sqlite_batch_group(
+        self,
+        *,
+        temp_prefix: Optional[str] = None,
+    ) -> Iterator[None]:
+        """Run several :meth:`.batch_alter_table` blocks as one atomic
+        SQLite grouped migration.
+
+        .. versionadded:: 1.18.0
+
+        Ordinary SQLite batch mode rebuilds each table independently.
+        When tables reference each other (including self references and
+        multi-table foreign key cycles), this requires turning
+        ``PRAGMA foreign_keys`` off manually in ``env.py`` and carefully
+        restoring it, with no transactional guarantee across the whole
+        migration.  :meth:`!sqlite_batch_group` takes over that
+        responsibility::
+
+            with op.sqlite_batch_group():
+                with op.batch_alter_table("orders") as batch_op:
+                    batch_op.alter_column("note", nullable=False)
+                with op.batch_alter_table("order_items") as batch_op:
+                    batch_op.alter_column("label", nullable=False)
+
+        The group supports ``alter_column``, ``add_column``,
+        ``drop_column``, ``create_foreign_key``, ``drop_constraint``,
+        ``create_index`` and ``drop_index``.  Tables that can be changed
+        with a native ``ALTER TABLE`` are altered directly, while tables
+        requiring the copy-and-rename rebuild use the same rebuild
+        machinery as regular batch mode.
+
+        Guarantees and requirements:
+
+        * Online SQLite only, with
+          :paramref:`.EnvironmentContext.configure.transaction_per_migration`
+          enabled.  The group owns the per-revision transaction: the table
+          changes and the ``alembic_version`` update commit or roll back
+          together.
+        * ``foreign_keys`` is disabled for the duration of the rebuild and
+          restored to its previous value afterwards, both on success and
+          on failure.
+        * ``PRAGMA foreign_key_check`` is run before commit; existing data
+          that violates the new constraints aborts the revision without
+          modifying or deleting any row.
+        * Tables outside the group, including tables that reference group
+          tables with ``ON DELETE CASCADE``, are left untouched.
+        * No temporary tables, indexes or references remain in
+          ``sqlite_master`` afterwards.
+
+        Offline ``--sql`` mode, pre-existing caller transactions, nested
+        groups, multiple groups within one revision, unsupported
+        operations, virtual tables, triggers and dependent views are
+        rejected before any change is made.
+
+        :param temp_prefix: optional prefix used for the internal copy
+         tables.  Overriding is normally unnecessary; the default is chosen
+         to be unique within the group and unlikely to collide with
+         application objects.
+        """
+        with grouped.sqlite_batch_group(self, temp_prefix=temp_prefix):
+            yield
 
     def get_context(self) -> MigrationContext:
         """Return the :class:`.MigrationContext` object that's

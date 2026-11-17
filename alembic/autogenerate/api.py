@@ -205,7 +205,7 @@ def render_python_code(
     up_or_down_op: Union[UpgradeOps, DowngradeOps],
     sqlalchemy_module_prefix: str = "sa.",
     alembic_module_prefix: str = "op.",
-    render_as_batch: bool = False,
+    render_as_batch: Union[bool, str] = False,
     imports: Sequence[str] = (),
     render_item: Optional[RenderItemFn] = None,
     migration_context: Optional[MigrationContext] = None,
@@ -220,7 +220,9 @@ def render_python_code(
     :param up_or_down_op: :class:`.UpgradeOps` or :class:`.DowngradeOps` object
     :param sqlalchemy_module_prefix: module prefix for SQLAlchemy objects
     :param alembic_module_prefix: module prefix for Alembic constructs
-    :param render_as_batch: use "batch operations" style for rendering
+    :param render_as_batch: ``False`` for plain directives, ``True`` for
+     per-table batch blocks, or ``"grouped"`` to wrap the batch blocks of
+     one revision in a single ``op.sqlite_batch_group()`` block
     :param imports: sequence of import symbols to add
     :param render_item: callable to render items
     :param migration_context: optional :class:`.MigrationContext`
@@ -229,6 +231,11 @@ def render_python_code(
      .. versionadded:: 1.11.0
 
     """
+    if render_as_batch not in (False, True, "grouped"):
+        raise ValueError(
+            "render_as_batch must be False, True or 'grouped'; got %r"
+            % (render_as_batch,)
+        )
     opts = {
         "sqlalchemy_module_prefix": sqlalchemy_module_prefix,
         "alembic_module_prefix": alembic_module_prefix,
