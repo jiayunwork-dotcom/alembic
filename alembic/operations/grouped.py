@@ -66,6 +66,7 @@ _GROUPED_ALLOWED_OPS = frozenset(
         "drop_constraint",
         "create_index",
         "drop_index",
+        "set_table_autoincrement",
     ]
 )
 

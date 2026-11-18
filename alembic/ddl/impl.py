@@ -196,6 +196,58 @@ class DefaultImpl(metaclass=ImplMeta):
 
         """
 
+    def adjust_batch_table_kwargs(
+        self,
+        table: Table,
+        table_kwargs: Dict[str, Any],
+        reflected: bool,
+    ) -> None:
+        """Adjust the table options used for a batch rebuild.
+
+        The SQLite dialect uses this to carry over the ``AUTOINCREMENT``
+        attribute, which is not part of SQLAlchemy's reflection of the
+        table, from the live database to the new copy.
+        """
+
+    def begin_batch_table_rebuild(
+        self, batch_impl: ApplyBatchImpl, table: Table
+    ) -> Any:
+        """Return opaque state captured before a batch table is rebuilt.
+
+        The SQLite dialect uses this to remember the committed sequence
+        history of an ``AUTOINCREMENT`` table before the original table
+        (and with it the ``sqlite_sequence`` row) is dropped.
+        """
+
+        return None
+
+    def finish_batch_table_rebuild(
+        self, batch_impl: ApplyBatchImpl, state: Any
+    ) -> None:
+        """Restore state captured by :meth:`.begin_batch_table_rebuild`
+        after the rebuilt table has been renamed to its final name.
+        """
+
+    def set_table_autoincrement(
+        self,
+        table_name: str,
+        *,
+        enabled: bool,
+        existing_enabled: Optional[bool] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        """Change a table-level autoincrement option.
+
+        This is SQLite-specific; other backends report that the directive
+        is unsupported rather than silently ignoring it.
+        """
+
+        raise NotImplementedError(
+            "set_sqlite_autoincrement is only supported by the SQLite "
+            "dialect; use batch_alter_table() with the appropriate table "
+            "options on other backends."
+        )
+
     @property
     def bind(self) -> Optional[Connection]:
         return self.connection

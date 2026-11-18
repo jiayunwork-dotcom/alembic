@@ -100,7 +100,7 @@ def configure(
     starting_rev: Optional[str] = None,
     tag: Optional[str] = None,
     template_args: Optional[Dict[str, Any]] = None,
-    render_as_batch: Union[bool, Literal["grouped"]] = False,
+    render_as_batch: Union[bool, str] = False,
     target_metadata: Union[MetaData, Sequence[MetaData], None] = None,
     include_name: Optional[
         Callable[
@@ -489,16 +489,20 @@ def configure(
 
         :paramref:`.EnvironmentContext.configure.include_schemas`
 
-    :param render_as_batch: ``False`` for plain directives, ``True`` to
-     place commands which alter elements within a table under a
-     ``with batch_alter_table():`` directive, or the string ``"grouped"``
-     to additionally wrap the batch blocks of a revision in a single
-     ``with op.sqlite_batch_group():`` block for atomic SQLite
-     multi-table migrations.
+    :param render_as_batch: controls how commands which alter elements
+     within a table are rendered.  When ``False`` (the default), plain
+     ``alter_*`` directives are emitted.  When ``True``, the changes of
+     each table are placed under a ``with batch_alter_table():``
+     directive.  When set to the string ``"grouped"``, all
+     per-table batch blocks of one revision are additionally wrapped
+     together in a ``with op.sqlite_batch_group():`` block so that
+     related tables can be rebuilt atomically on SQLite.
 
      .. seealso::
 
         :ref:`batch_migrations`
+
+        :ref:`sqlite_grouped_batch`
 
     :param include_schemas: If True, autogenerate will scan across
      all schemas located by the SQLAlchemy

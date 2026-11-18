@@ -145,6 +145,18 @@ def rename_table(
     )
 
 
+@Operations.implementation_for(ops.SetTableAutoincrementOp)
+def set_sqlite_autoincrement(
+    operations: "Operations", operation: "ops.SetTableAutoincrementOp"
+) -> None:
+    operations.impl.set_table_autoincrement(
+        operation.table_name,
+        enabled=operation.enabled,
+        existing_enabled=operation.existing_enabled,
+        schema=operation.schema,
+    )
+
+
 @Operations.implementation_for(ops.CreateTableCommentOp)
 def create_table_comment(
     operations: "Operations", operation: "ops.CreateTableCommentOp"

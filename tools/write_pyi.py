@@ -381,6 +381,7 @@ location = Path(__file__).parent.parent / "alembic"
 
 cls_ignore = {
     "batch_alter_table",
+    "sqlite_batch_group",
     "context",
     "create_module_class_proxy",
     "f",
@@ -399,7 +400,7 @@ cases = [
         location / "op.pyi",
         Operations,
         ignore_items={"context", "create_module_class_proxy"},
-        context_managers={"batch_alter_table"},
+        context_managers={"batch_alter_table", "sqlite_batch_group"},
     ),
     StubFileInfo(
         "context",

@@ -199,6 +199,26 @@ class BatchOperationsImpl:
     def drop_table_comment(self, table):
         self.batch.append(("drop_table_comment", (table,), {}))
 
+    def set_table_autoincrement(
+        self,
+        table_name,
+        *,
+        enabled,
+        existing_enabled=None,
+        schema=None,
+    ):
+        # the option is applied to the replacement table's CREATE
+        # statement; the recorded plan entry makes the dialect ask for a
+        # recreate and keeps the grouped validation in sync.
+        self.table_kwargs["sqlite_autoincrement"] = bool(enabled)
+        self.batch.append(
+            (
+                "set_table_autoincrement",
+                (table_name,),
+                {"enabled": bool(enabled)},
+            )
+        )
+
     def create_table(self, table):
         raise NotImplementedError("Can't create table in batch mode")
 
@@ -440,7 +460,18 @@ class ApplyBatchImpl:
                 )
 
     def _create(self, op_impl: DefaultImpl) -> None:
+        # let the dialect decide the final table options (SQLite carries
+        # the AUTOINCREMENT attribute over from the live database here)
+        # before the replacement table's DDL is assembled.
+        op_impl.adjust_batch_table_kwargs(
+            self.table, self.table_kwargs, self.reflected
+        )
         self._transfer_elements_to_new_table()
+
+        # capture anything the dialect must keep across the drop of the
+        # original table (SQLite's committed AUTOINCREMENT history lives
+        # in sqlite_sequence, outside the CREATE TABLE statement).
+        rebuild_state = op_impl.begin_batch_table_rebuild(self, self.table)
 
         op_impl.prep_table_for_batch(self, self.table)
         assert self.new_table is not None
@@ -479,6 +510,10 @@ class ApplyBatchImpl:
                     op_impl.create_index(idx)
             finally:
                 self.new_table.name = self.temp_table_name
+            # restore the state captured before the rename; SQLite uses
+            # this to put the committed sequence history back on the
+            # rebuilt table, inside the same transaction.
+            op_impl.finish_batch_table_rebuild(self, rebuild_state)
 
     def alter_column(
         self,
@@ -707,6 +742,18 @@ class ApplyBatchImpl:
 
     def create_index(self, idx: Index) -> None:
         self.new_indexes[idx.name] = idx  # type: ignore[index]
+
+    def set_table_autoincrement(
+        self,
+        table_name,
+        *,
+        enabled,
+        existing_enabled=None,
+        schema=None,
+    ) -> None:
+        # the option is carried into the replacement CREATE TABLE through
+        # ``table_kwargs``; there is no per-column directive to apply.
+        self.table_kwargs["sqlite_autoincrement"] = bool(enabled)
 
     def drop_index(self, idx: Index) -> None:
         try:

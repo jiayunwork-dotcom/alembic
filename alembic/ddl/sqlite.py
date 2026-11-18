@@ -16,6 +16,7 @@ from sqlalchemy import JSON
 from sqlalchemy import schema
 from sqlalchemy import sql
 
+from . import _sqlite_autoincrement
 from .base import alter_table
 from .base import ColumnName
 from .base import format_column_name
@@ -46,6 +47,74 @@ class SQLiteImpl(DefaultImpl):
     see: http://bugs.python.org/issue10740
     """
 
+    def adjust_batch_table_kwargs(
+        self,
+        table: Table,
+        table_kwargs: Dict[str, Any],
+        reflected: bool,
+    ) -> None:
+        """Carry the ``AUTOINCREMENT`` table attribute into the rebuild.
+
+        SQLAlchemy does not reflect SQLite's ``AUTOINCREMENT`` attribute, so
+        without this a rebuild driven by an unrelated change (or by a
+        ``table_kwargs={"sqlite_autoincrement": True}`` request) would
+        silently drop it from the new ``CREATE TABLE``.
+        """
+
+        reflected_autoincrement: Optional[bool] = None
+        if self.connection is not None and not self.as_sql:
+            sql_text = _sqlite_autoincrement.get_table_sql(
+                self.connection, table.name, schema=table.schema
+            )
+            reflected_autoincrement = (
+                _sqlite_autoincrement.ddl_uses_autoincrement(sql_text)
+            )
+
+        resolved = _sqlite_autoincrement.resolve_table_autoincrement(
+            table, table_kwargs, reflected_autoincrement
+        )
+        if resolved is not None:
+            # the option has to be present in the CREATE TABLE we assemble
+            # in _transfer_elements_to_new_table(); table_kwargs is what
+            # that constructor receives.
+            table_kwargs["sqlite_autoincrement"] = resolved
+
+    def begin_batch_table_rebuild(self, batch_impl: Any, table: Table) -> Any:
+        """Record the committed ``AUTOINCREMENT`` history before the drop.
+
+        The history lives in ``sqlite_sequence`` keyed by table name and is
+        removed by ``DROP TABLE``.  It is captured before the rebuild and
+        restored after the rename, inside the surrounding transaction, so a
+        rollback restores it as well.
+        """
+
+        if self.as_sql or self.connection is None:
+            # offline mode has no live sequence state to preserve
+            return None
+        enabled = _sqlite_autoincrement.table_uses_autoincrement(
+            self.connection, table.name, schema=table.schema
+        )
+        if not enabled:
+            return None
+        return _sqlite_autoincrement.read_sequence(
+            self.connection, table.name, schema=table.schema
+        )
+
+    def finish_batch_table_rebuild(self, batch_impl: Any, state: Any) -> None:
+        if state is None or self.as_sql or self.connection is None:
+            return
+        table = batch_impl.table
+        # only restore when the rebuilt table still uses AUTOINCREMENT; an
+        # explicit sqlite_autoincrement=False means "ordinary allocation"
+        # and deliberately drops the old non-reuse guarantee.
+        if not _sqlite_autoincrement.table_uses_autoincrement(
+            self.connection, table.name, schema=table.schema
+        ):
+            return
+        _sqlite_autoincrement.restore_sequence(
+            self.connection, table.name, state, schema=table.schema
+        )
+
     def requires_recreate_in_batch(
         self, batch_op: BatchOperationsImpl
     ) -> bool:
@@ -57,6 +126,17 @@ class SQLiteImpl(DefaultImpl):
         than add_column are present.
 
         """
+        if any(op[0] == "set_table_autoincrement" for op in batch_op.batch):
+            # changing the table-level AUTOINCREMENT attribute always
+            # requires the copy-and-rename rebuild.
+            return True
+        if (
+            _sqlite_autoincrement.table_option_enabled(batch_op.table_kwargs)
+            is not None
+        ):
+            # ``table_kwargs`` is only applied to the replacement table's
+            # CREATE statement; a native ALTER TABLE would ignore it.
+            return True
         for op in batch_op.batch:
             if op[0] == "add_column":
                 col = op[1][1]
@@ -73,6 +153,31 @@ class SQLiteImpl(DefaultImpl):
                 return True
         else:
             return False
+
+    def set_table_autoincrement(
+        self,
+        table_name: str,
+        *,
+        enabled: bool,
+        existing_enabled: Optional[bool] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        """Enable or disable ``AUTOINCREMENT`` using a table rebuild.
+
+        Called from a batch (or grouped batch) context; by the time this
+        runs the enclosing rebuild has already produced the replacement
+        table's ``CREATE`` statement with the requested option.
+        """
+
+        # In batch mode the plan carries the option; this method exists so
+        # that a direct ``Operations.set_sqlite_autoincrement()`` call
+        # fails clearly instead of doing nothing.
+        raise util.CommandError(
+            "set_sqlite_autoincrement() must be used inside "
+            "batch_alter_table() or sqlite_batch_group(): the SQLite "
+            "AUTOINCREMENT attribute can only be changed by rebuilding "
+            "the table, which the batch context performs."
+        )
 
     def add_constraint(self, const: Constraint):
         # attempt to distinguish between an

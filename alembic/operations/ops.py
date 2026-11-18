@@ -1449,6 +1449,123 @@ class AlterTableOp(MigrateOperation):
         self.schema = schema
 
 
+@Operations.register_operation("set_sqlite_autoincrement")
+@BatchOperations.register_operation(
+    "set_sqlite_autoincrement", "batch_set_sqlite_autoincrement"
+)
+class SetTableAutoincrementOp(AlterTableOp):
+    """Represent a change to the SQLite ``AUTOINCREMENT`` table option.
+
+    SQLite's ``AUTOINCREMENT`` attribute is a property of the table's
+    ``CREATE TABLE`` statement rather than of a column, and its committed
+    numbering history lives in the internal ``sqlite_sequence`` table.
+    This operation changes the attribute while preserving that history when
+    the attribute stays enabled.
+    """
+
+    def __init__(
+        self,
+        table_name: str,
+        *,
+        enabled: bool,
+        existing_enabled: Optional[bool] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        super().__init__(table_name, schema=schema)
+        self.enabled = enabled
+        self.existing_enabled = existing_enabled
+
+    def reverse(self) -> SetTableAutoincrementOp:
+        if self.existing_enabled is None:
+            raise util.CommandError(
+                "existing_enabled is required to reverse a "
+                "set_sqlite_autoincrement operation."
+            )
+        return SetTableAutoincrementOp(
+            self.table_name,
+            enabled=self.existing_enabled,
+            existing_enabled=self.enabled,
+            schema=self.schema,
+        )
+
+    def to_diff_tuple(self) -> Tuple[Any, ...]:
+        return (
+            "modify_table_autoincrement",
+            self.schema,
+            self.table_name,
+            {"existing_enabled": self.existing_enabled},
+            self.existing_enabled,
+            self.enabled,
+        )
+
+    @classmethod
+    def set_sqlite_autoincrement(
+        cls,
+        operations: Operations,
+        table_name: str,
+        *,
+        enabled: bool,
+        existing_enabled: Optional[bool] = None,
+        schema: Optional[str] = None,
+    ) -> None:
+        """Enable or disable the SQLite ``AUTOINCREMENT`` table option.
+
+        When ``enabled`` is True, the committed numbering history of an
+        already ``AUTOINCREMENT`` table is preserved: numbers that were
+        handed out and whose rows were later deleted are never issued
+        again.  When the option is turned off, SQLite's ordinary
+        ``INTEGER PRIMARY KEY`` allocation applies and the old
+        non-reuse guarantee is intentionally dropped; enabling it again
+        later starts a fresh history from the data present at that time.
+
+        This operation rebuilds the table using the batch copy-and-rename
+        machinery, so it is normally used within
+        :meth:`.Operations.batch_alter_table` or
+        :meth:`.Operations.sqlite_batch_group`.
+
+        :param table_name: name of the table.
+        :param enabled: True to enable ``AUTOINCREMENT``, False to disable.
+        :param existing_enabled: the previous value of the option, used
+         when reversing the operation in autogenerate.
+        :param schema: optional schema name.
+
+        .. versionadded:: 1.18.0
+
+        """
+        op = cls(
+            table_name,
+            enabled=enabled,
+            existing_enabled=existing_enabled,
+            schema=schema,
+        )
+        return operations.invoke(op)
+
+    @classmethod
+    def batch_set_sqlite_autoincrement(
+        cls,
+        operations: BatchOperations,
+        *,
+        enabled: bool,
+        existing_enabled: Optional[bool] = None,
+    ) -> None:
+        """Enable or disable the SQLite ``AUTOINCREMENT`` table option in
+        batch mode.
+
+        .. seealso::
+
+            :meth:`.Operations.set_sqlite_autoincrement`
+
+        """
+
+        op = cls(
+            operations.impl.table_name,
+            enabled=enabled,
+            existing_enabled=existing_enabled,
+            schema=operations.impl.schema,
+        )
+        return operations.invoke(op)
+
+
 @Operations.register_operation("rename_table")
 class RenameTableOp(AlterTableOp):
     """Represent a rename table operation."""

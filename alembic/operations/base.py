@@ -448,10 +448,14 @@ class AbstractOperations(util.ModuleClsProxy):
 
         The group supports ``alter_column``, ``add_column``,
         ``drop_column``, ``create_foreign_key``, ``drop_constraint``,
-        ``create_index`` and ``drop_index``.  Tables that can be changed
+        ``create_index``, ``drop_index`` and ``set_sqlite_autoincrement``.
+        Tables that can be changed
         with a native ``ALTER TABLE`` are altered directly, while tables
         requiring the copy-and-rename rebuild use the same rebuild
-        machinery as regular batch mode.
+        machinery as regular batch mode.  Rebuilding a table that uses
+        SQLite's ``AUTOINCREMENT`` attribute preserves the attribute and
+        its committed numbering history; see
+        :ref:`sqlite_batch_autoincrement`.
 
         Guarantees and requirements:
 
@@ -1709,6 +1713,40 @@ class Operations(AbstractOperations):
             """  # noqa: E501
             ...
 
+        def set_sqlite_autoincrement(
+            self,
+            table_name: str,
+            *,
+            enabled: bool,
+            existing_enabled: Optional[bool] = None,
+            schema: Optional[str] = None,
+        ) -> None:
+            """Enable or disable the SQLite ``AUTOINCREMENT`` table option.
+
+            When ``enabled`` is True, the committed numbering history of an
+            already ``AUTOINCREMENT`` table is preserved: numbers that were
+            handed out and whose rows were later deleted are never issued
+            again.  When the option is turned off, SQLite's ordinary
+            ``INTEGER PRIMARY KEY`` allocation applies and the old
+            non-reuse guarantee is intentionally dropped; enabling it again
+            later starts a fresh history from the data present at that time.
+
+            This operation rebuilds the table using the batch copy-and-rename
+            machinery, so it is normally used within
+            :meth:`.Operations.batch_alter_table` or
+            :meth:`.Operations.sqlite_batch_group`.
+
+            :param table_name: name of the table.
+            :param enabled: True to enable ``AUTOINCREMENT``, False to disable.
+            :param existing_enabled: the previous value of the option, used
+             when reversing the operation in autogenerate.
+            :param schema: optional schema name.
+
+            .. versionadded:: 1.18.0
+
+            """  # noqa: E501
+            ...
+
         # END STUB FUNCTIONS: op_cls
 
 
@@ -2004,6 +2042,19 @@ class BatchOperations(AbstractOperations):
             .. seealso::
 
                 :meth:`.Operations.execute`
+
+            """  # noqa: E501
+            ...
+
+        def set_sqlite_autoincrement(
+            self, *, enabled: bool, existing_enabled: Optional[bool] = None
+        ) -> None:
+            """Enable or disable the SQLite ``AUTOINCREMENT`` table option in
+            batch mode.
+
+            .. seealso::
+
+                :meth:`.Operations.set_sqlite_autoincrement`
 
             """  # noqa: E501
             ...

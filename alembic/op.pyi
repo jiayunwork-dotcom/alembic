@@ -252,64 +252,6 @@ def alter_column(
     """
 
 @contextmanager
-def sqlite_batch_group(*, temp_prefix: Optional[str] = None) -> Iterator[None]:
-    """Run several :meth:`.batch_alter_table` blocks as one atomic
-    SQLite grouped migration.
-
-    .. versionadded:: 1.18.0
-
-    Ordinary SQLite batch mode rebuilds each table independently.
-    When tables reference each other (including self references and
-    multi-table foreign key cycles), this requires turning
-    ``PRAGMA foreign_keys`` off manually in ``env.py`` and carefully
-    restoring it, with no transactional guarantee across the whole
-    migration.  :meth:`!sqlite_batch_group` takes over that
-    responsibility::
-
-        with op.sqlite_batch_group():
-            with op.batch_alter_table("orders") as batch_op:
-                batch_op.alter_column("note", nullable=False)
-            with op.batch_alter_table("order_items") as batch_op:
-                batch_op.alter_column("label", nullable=False)
-
-    The group supports ``alter_column``, ``add_column``,
-    ``drop_column``, ``create_foreign_key``, ``drop_constraint``,
-    ``create_index`` and ``drop_index``.  Tables that can be changed
-    with a native ``ALTER TABLE`` are altered directly, while tables
-    requiring the copy-and-rename rebuild use the same rebuild
-    machinery as regular batch mode.
-
-    Guarantees and requirements:
-
-    * Online SQLite only, with
-      :paramref:`.EnvironmentContext.configure.transaction_per_migration`
-      enabled.  The group owns the per-revision transaction: the table
-      changes and the ``alembic_version`` update commit or roll back
-      together.
-    * ``foreign_keys`` is disabled for the duration of the rebuild and
-      restored to its previous value afterwards, both on success and
-      on failure.
-    * ``PRAGMA foreign_key_check`` is run before commit; existing data
-      that violates the new constraints aborts the revision without
-      modifying or deleting any row.
-    * Tables outside the group, including tables that reference group
-      tables with ``ON DELETE CASCADE``, are left untouched.
-    * No temporary tables, indexes or references remain in
-      ``sqlite_master`` afterwards.
-
-    Offline ``--sql`` mode, pre-existing caller transactions, nested
-    groups, multiple groups within one revision, unsupported
-    operations, virtual tables, triggers and dependent views are
-    rejected before any change is made.
-
-    :param temp_prefix: optional prefix used for the internal copy
-     tables.  Overriding is normally unnecessary; the default is chosen
-     to be unique within the group and unlikely to collide with
-     application objects.
-
-    """
-
-@contextmanager
 def batch_alter_table(
     table_name: str,
     schema: Optional[str] = None,
@@ -1272,14 +1214,27 @@ def get_context() -> MigrationContext:
 
     """
 
-def implementation_for(op_cls: Any) -> Callable[[_C], _C]:
+def implementation_for(
+    op_cls: Any, replace: bool = False
+) -> Callable[[_C], _C]:
     """Register an implementation for a given :class:`.MigrateOperation`.
+
+    :param replace: when True, allows replacement of an already
+     registered implementation for the given operation class. This
+     enables customization of built-in operations such as
+     :class:`.CreateTableOp` by providing an alternate implementation
+     that can augment, modify, or conditionally invoke the default
+     behavior.
+
+     .. versionadded:: 1.17.2
 
     This is part of the operation extensibility API.
 
     .. seealso::
 
-        :ref:`operation_plugins` - example of use
+        :ref:`operation_plugins`
+
+        :ref:`operations_extending_builtin`
 
     """
 
@@ -1411,4 +1366,97 @@ def run_async(
 
         This method can be called only when alembic is called using
         an async dialect.
+    """
+
+def set_sqlite_autoincrement(
+    table_name: str,
+    *,
+    enabled: bool,
+    existing_enabled: Optional[bool] = None,
+    schema: Optional[str] = None,
+) -> None:
+    """Enable or disable the SQLite ``AUTOINCREMENT`` table option.
+
+    When ``enabled`` is True, the committed numbering history of an
+    already ``AUTOINCREMENT`` table is preserved: numbers that were
+    handed out and whose rows were later deleted are never issued
+    again.  When the option is turned off, SQLite's ordinary
+    ``INTEGER PRIMARY KEY`` allocation applies and the old
+    non-reuse guarantee is intentionally dropped; enabling it again
+    later starts a fresh history from the data present at that time.
+
+    This operation rebuilds the table using the batch copy-and-rename
+    machinery, so it is normally used within
+    :meth:`.Operations.batch_alter_table` or
+    :meth:`.Operations.sqlite_batch_group`.
+
+    :param table_name: name of the table.
+    :param enabled: True to enable ``AUTOINCREMENT``, False to disable.
+    :param existing_enabled: the previous value of the option, used
+     when reversing the operation in autogenerate.
+    :param schema: optional schema name.
+
+    .. versionadded:: 1.18.0
+
+    """
+
+@contextmanager
+def sqlite_batch_group(*, temp_prefix: Optional[str] = None) -> Iterator[None]:
+    """Run several :meth:`.batch_alter_table` blocks as one atomic
+    SQLite grouped migration.
+
+    .. versionadded:: 1.18.0
+
+    Ordinary SQLite batch mode rebuilds each table independently.
+    When tables reference each other (including self references and
+    multi-table foreign key cycles), this requires turning
+    ``PRAGMA foreign_keys`` off manually in ``env.py`` and carefully
+    restoring it, with no transactional guarantee across the whole
+    migration.  :meth:`!sqlite_batch_group` takes over that
+    responsibility::
+
+        with op.sqlite_batch_group():
+            with op.batch_alter_table("orders") as batch_op:
+                batch_op.alter_column("note", nullable=False)
+            with op.batch_alter_table("order_items") as batch_op:
+                batch_op.alter_column("label", nullable=False)
+
+    The group supports ``alter_column``, ``add_column``,
+    ``drop_column``, ``create_foreign_key``, ``drop_constraint``,
+    ``create_index``, ``drop_index`` and ``set_sqlite_autoincrement``.
+    Tables that can be changed
+    with a native ``ALTER TABLE`` are altered directly, while tables
+    requiring the copy-and-rename rebuild use the same rebuild
+    machinery as regular batch mode.  Rebuilding a table that uses
+    SQLite's ``AUTOINCREMENT`` attribute preserves the attribute and
+    its committed numbering history; see
+    :ref:`sqlite_batch_autoincrement`.
+
+    Guarantees and requirements:
+
+    * Online SQLite only, with
+      :paramref:`.EnvironmentContext.configure.transaction_per_migration`
+      enabled.  The group owns the per-revision transaction: the table
+      changes and the ``alembic_version`` update commit or roll back
+      together.
+    * ``foreign_keys`` is disabled for the duration of the rebuild and
+      restored to its previous value afterwards, both on success and
+      on failure.
+    * ``PRAGMA foreign_key_check`` is run before commit; existing data
+      that violates the new constraints aborts the revision without
+      modifying or deleting any row.
+    * Tables outside the group, including tables that reference group
+      tables with ``ON DELETE CASCADE``, are left untouched.
+    * No temporary tables, indexes or references remain in
+      ``sqlite_master`` afterwards.
+
+    Offline ``--sql`` mode, pre-existing caller transactions, nested
+    groups, multiple groups within one revision, unsupported
+    operations, virtual tables, triggers and dependent views are
+    rejected before any change is made.
+
+    :param temp_prefix: optional prefix used for the internal copy
+     tables.  Overriding is normally unnecessary; the default is chosen
+     to be unique within the group and unlikely to collide with
+     application objects.
     """

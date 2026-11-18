@@ -31,6 +31,7 @@ from sqlalchemy.sql.schema import UniqueConstraint
 from sqlalchemy.util import OrderedSet
 
 from .. import util
+from ..ddl import _sqlite_autoincrement
 from ..ddl._autogen import is_index_sig
 from ..ddl._autogen import is_uq_sig
 from ..operations import ops
@@ -1330,6 +1331,63 @@ def _compare_foreign_keys(
                 else None
             )
             _add_fk(const, compare_to)
+
+
+@comparators.dispatch_for("table")
+def _compare_sqlite_autoincrement(
+    autogen_context: AutogenContext,
+    modify_table_ops: ModifyTableOps,
+    schema: Optional[str],
+    tname: Union[quoted_name, str],
+    conn_table: Optional[Table],
+    metadata_table: Optional[Table],
+) -> None:
+    """Compare the SQLite ``AUTOINCREMENT`` table attribute.
+
+    This is only emitted in grouped mode: ``sqlite_autoincrement`` is a
+    table option rather than a column flag, so the attribute difference has
+    no representation in plain or per-table batch scripts.  Grouped mode
+    has an explicit ``set_sqlite_autoincrement`` directive.
+    """
+
+    if autogen_context.opts.get("render_as_batch", False) != "grouped":
+        return
+    assert autogen_context.dialect is not None
+    if autogen_context.dialect.name != "sqlite":
+        return
+    if conn_table is None or metadata_table is None:
+        return
+
+    target_enabled = _sqlite_autoincrement.table_option_enabled(
+        metadata_table.kwargs, metadata_table.dialect_kwargs
+    )
+    if target_enabled is None:
+        # target metadata does not state the option: keep whatever the
+        # live database does, no diff.
+        return
+
+    connection = autogen_context.connection
+    if connection is None:
+        return
+    existing_enabled = _sqlite_autoincrement.table_uses_autoincrement(
+        connection, conn_table.name, schema=schema
+    )
+    if existing_enabled == target_enabled:
+        return
+
+    modify_table_ops.ops.append(
+        ops.SetTableAutoincrementOp(
+            tname,
+            enabled=target_enabled,
+            existing_enabled=existing_enabled,
+            schema=schema,
+        )
+    )
+    log.info(
+        "Detected %s of SQLite AUTOINCREMENT on table '%s'",
+        "enable" if target_enabled else "disable",
+        tname,
+    )
 
 
 @comparators.dispatch_for("table")

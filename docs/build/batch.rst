@@ -491,3 +491,101 @@ blocks, no group) behaviors are unchanged.  Because a group can only alter
 existing tables, a revision that also creates or drops whole tables cannot
 be rendered as one group and autogenerate reports the unsupported
 differences instead of emitting a script that would fail at runtime.
+
+.. _sqlite_batch_autoincrement:
+
+Preserving ``AUTOINCREMENT`` numbering across a rebuild
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SQLite keeps the highest number ever committed for an ``AUTOINCREMENT``
+table in its internal ``sqlite_sequence`` table.  That number is *not* part
+of the ``CREATE TABLE`` statement, and SQLAlchemy's reflection does not
+report the attribute, so a naive copy-and-rename rebuild drops both the
+``AUTOINCREMENT`` keyword and the committed history.  After such a rebuild
+SQLite hands out numbers starting from the highest remaining row, which
+means numbers belonging to deleted rows can be issued again::
+
+    CREATE TABLE fact(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      note VARCHAR(20));
+    INSERT INTO fact(id) VALUES (1), (1000);
+    DELETE FROM fact WHERE id = 1000;
+    -- after a plain batch rebuild of "fact":
+    INSERT INTO fact(note) VALUES ('new');  -- id 2, expected 1001
+
+Alembic now carries the attribute and the history through the rebuild:
+
+* If the live table uses ``AUTOINCREMENT``, an ordinary batch rebuild keeps
+  it and restores the committed ``sqlite_sequence`` mark, even when the
+  table has been emptied and even when the row holding the highest number
+  was deleted.  The maximum *remaining* primary key is never used as a
+  substitute for the committed history.
+* The same applies when the attribute is requested explicitly with
+  ``table_kwargs={"sqlite_autoincrement": True}``, on
+  :meth:`.Operations.batch_alter_table` and inside
+  :meth:`.Operations.sqlite_batch_group`.
+* A table created as a plain ``INTEGER PRIMARY KEY`` keeps SQLite's ordinary
+  allocation--the first presumably suitable number is used and deleted
+  numbers may be reused.
+* Each table's history is independent; tables outside the group and tables
+  that took the native ``ALTER TABLE`` path are untouched.
+* Numbers are restored inside the same transaction as the rebuild, so a
+  failed or rolled-back migration (including the ``alembic_version``
+  update) restores the previous history.  Numbers committed by a
+  transaction that later rolled back were never part of the history.
+* If the committed mark has reached SQLite's signed 64-bit ceiling, the
+  next insert after the migration still raises an error rather than reusing
+  a number, exactly as it would without the migration.
+
+To change the attribute itself, use
+:meth:`.Operations.set_sqlite_autoincrement` inside a batch block::
+
+    with op.batch_alter_table("fact") as batch_op:
+        # enable AUTOINCREMENT, keeping the committed history
+        batch_op.set_sqlite_autoincrement(enabled=True, existing_enabled=False)
+
+    with op.sqlite_batch_group():
+        with op.batch_alter_table("fact") as batch_op:
+            # disable it: ordinary allocation applies from now on and the
+            # old non-reuse guarantee is intentionally dropped
+            batch_op.set_sqlite_autoincrement(enabled=False, existing_enabled=True)
+
+Enabling the attribute starts a fresh history from the data present at
+that moment; enabling it again after it was disabled starts a new history
+from the data present then.  A migration that changes something else while
+the attribute remains in place continues the original history.
+
+In grouped autogenerate mode (``render_as_batch="grouped"``) a difference
+in the ``sqlite_autoincrement`` table option is detected and rendered as a
+``set_sqlite_autoincrement()`` directive with a reversing downgrade.  This
+comparison is only performed in grouped mode; ``render_as_batch=False`` and
+``render_as_batch=True`` keep their previous behavior.
+
+Implementation notes and trade-offs
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Two ways of moving the numbering history across a rebuild were considered.
+
+*A dialect hook inside the existing rebuild* (the one that is implemented)
+has the SQLite dialect read the committed mark from ``sqlite_sequence``
+just before the original table is dropped, and write it back after the
+replacement table has been renamed, using the ``begin_batch_table_rebuild``
+/ ``finish_batch_table_rebuild`` hooks on
+:class:`.DefaultImpl`.  Only a single integer per rebuilt table is carried
+in Python; no business row is kept alive to "reserve" a number and no
+auxiliary table is created.  The read and the write are ordinary statements
+of the same transaction that already owns the rebuild, so they cost no extra
+temporary database objects, add only a negligible amount to the lock hold
+time, and are rolled back together with the DDL, the copied data and the
+``alembic_version`` stamp.  The dialect dependency is limited to
+``SQLiteImpl``; other backends inherit no-op hooks.
+
+*A post-group fixup or a side table* would record the history outside the
+rebuild (for example a Python dictionary finalized after the group commits,
+or a journal table that a later step replays).  It has to either give up
+atomicity - a failure between the rebuild and the fixup would leave the
+history lost - or introduce an additional schema object and a second write
+phase at the end of the migration, extending the lock hold time and moving
+part of the work outside the group's rollback scope.  It would also have to
+be wired into both grouped and per-table batch runs to keep ordinary batch
+mode consistent.  The in-transaction hook was therefore chosen.
+

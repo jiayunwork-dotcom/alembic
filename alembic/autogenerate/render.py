@@ -576,6 +576,29 @@ def _drop_column(autogen_context: AutogenContext, op: ops.DropColumnOp) -> str:
     return text
 
 
+@renderers.dispatch_for(ops.SetTableAutoincrementOp)
+def _set_sqlite_autoincrement(
+    autogen_context: AutogenContext, op: ops.SetTableAutoincrementOp
+) -> str:
+    if autogen_context._has_batch:
+        template = "%(prefix)sset_sqlite_autoincrement(enabled=%(enabled)r"
+    else:
+        template = (
+            "%(prefix)sset_sqlite_autoincrement(%(tname)r, enabled=%(enabled)r"
+        )
+    text = template % {
+        "prefix": _alembic_autogenerate_prefix(autogen_context),
+        "tname": _ident(op.table_name),
+        "enabled": op.enabled,
+    }
+    if op.existing_enabled is not None:
+        text += ", existing_enabled=%r" % (op.existing_enabled,)
+    if op.schema and not autogen_context._has_batch:
+        text += ", schema=%r" % _ident(op.schema)
+    text += ")"
+    return text
+
+
 @renderers.dispatch_for(ops.AlterColumnOp)
 def _alter_column(
     autogen_context: AutogenContext, op: ops.AlterColumnOp

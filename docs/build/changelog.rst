@@ -33,6 +33,33 @@ Changelog
 
             :ref:`sqlite_grouped_batch`
 
+    .. change::
+        :tags: bug, sqlite, operations, autogenerate
+
+        Fixed SQLite batch and grouped batch table rebuilds so that they
+        preserve the ``AUTOINCREMENT`` table attribute and the committed
+        numbering history stored in ``sqlite_sequence``.  Previously a
+        rebuild of a table with
+        ``id INTEGER PRIMARY KEY AUTOINCREMENT`` silently dropped the
+        attribute and the history, so after rows with higher numbers were
+        deleted SQLite would re-issue those numbers; the migration could
+        instead insert ``id=2`` when ``id=1001`` was required.  A new
+        :meth:`.Operations.set_sqlite_autoincrement` directive, usable
+        inside :meth:`.Operations.batch_alter_table` and
+        :meth:`.Operations.sqlite_batch_group`, enables or disables the
+        attribute while preserving the history when it stays enabled.
+        Difference detection for the attribute is added to grouped
+        autogenerate output (``render_as_batch="grouped"``), including a
+        reversing downgrade, and the plain ``False``/``True`` rendering
+        modes are unchanged.  The history is restored within the same
+        transaction as the rebuild, so a failed migration rolls the table
+        data, the sequence history and the ``alembic_version`` stamp back
+        together.
+
+        .. seealso::
+
+            :ref:`sqlite_batch_autoincrement`
+
 .. changelog::
     :version: 1.17.2
     :released: November 14, 2025
